@@ -1,0 +1,417 @@
+#!/usr/bin/env ruby
+require 'fileutils'
+require 'pathname'
+require 'securerandom'
+require_relative 'docker-remote'
+
+class StringTransform
+  class << self
+
+    def camelize(string)
+      string.capitalize.gsub(/_([a-z]+)/) { $1.capitalize }
+    end
+
+    def constantize(string)
+      klass_name = camelize(string)
+      Object.const_get(klass_name)
+    end
+  end
+end
+
+class Node
+
+  class << self
+
+    def load(node_root, app_name, node_name)
+      node_pwd = (Pathname.new(node_root) + app_name + node_name).expand_path
+      Kernel.load(node_pwd + 'Rockerfile')
+      node = StringTransform.constantize("#{node_name}_node").create
+      node.node_root = node_root
+      node.node_pwd = node_pwd
+      node.app_name = app_name
+      node.node_name = node_name
+      node
+    end
+
+    def load_all(node_root, app_name)
+    end
+  end
+
+  attr_accessor *%i(node_root node_pwd app_name node_name)
+
+  def initialize(interface, dependencies, data)
+    @interface, @dependencies, @data =
+      interface, dependencies, data
+  end
+
+  def name
+    @interface[:name]
+  end
+
+  def port
+    @interface[:port] or []
+  end
+
+  def host_env
+    {}
+  end
+
+  def links
+    []
+  end
+
+  def node_uid
+    Process.uid
+  end
+
+  def node_gid
+    Process.gid
+  end
+
+  def uid
+    @data[:uid]
+  end
+
+  def gid
+    @data[:gid] or uid
+  end
+
+  def pwd
+    @pwd ||= Pathname.new('/home') + @interface[:name]
+    @pwd
+  end
+
+  def from
+    @data[:from]
+  end
+
+  def volume
+    @data[:volume] or []
+  end
+
+  def generate_header
+    docker_command('FROM', from)
+  end
+
+  def pretend_user
+    docker_command('USER', name)
+    yield
+  end
+
+  def as_user
+    docker_command('USER', name)
+    docker_command('WORKDIR', pwd.to_s)
+    yield
+  end
+
+  def add_config_file(file, config_file)
+    docker_command('ADD', [config_file, file].join(' '))
+  end
+
+  def add_config_from(file, config_file)
+    content = File.read(node_pwd + config_file).split("\n").map do |l|
+      l.gsub(?\\) { "\\\\" }
+    end.join("\\n\\\n").gsub("'") { "\\'" }
+    run('echo', "$'#{content}'", ?>, file)
+  end
+
+  def add_config_json(file, config)
+    run('echo', "'#{config.to_json}'", ?>, file)
+  end
+
+  def add_config(file, config)
+    content = config.map { |k, v| "#{k} #{v}" }.join("\\n\\\n")
+    run('echo', "$'#{content}'", ?>, file)
+  end
+
+  def append_config(file, config)
+    content = config.map { |k, v| "#{k} #{v}" }.join("\\n\\\n")
+    run('echo', "$'#{content}'", '>>', file)
+  end
+
+  def mkdir(dir)
+    dir.descend do |path|
+      if !path.exist?
+        Dir.mkdir(path)
+        `setfacl -m d:u:#{uid}:rwx #{path}`
+        `setfacl -m u:#{uid}:rwx #{path}`
+        `setfacl -m m:rwx #{path}`
+      end
+    end
+  end
+
+  def rmdir(dir)
+    `rm -r #{dir}`
+  end
+
+  def with_path(path)
+    run('export', "PATH=#{path}:$PATH")
+    yield
+  end
+
+  def chdir(dir)
+    @dir ||= [pwd]
+    @dir << dir
+    script('cd', dir)
+    yield
+    script('cd', @dir[-2])
+    @dir.pop
+  end
+
+  def script(command, *args)
+    @script_commands ||= []
+    @script_commands << args.unshift(command).join(' ')
+  end
+
+  def generate_script
+    @script_commands ||= []
+    ['/bin/bash', '-c', @script_commands.join(' && ')]
+  end
+
+  def run(command, *args)
+    tail = args.join(' ')
+    docker_command('RUN', [command, tail].join(' '))
+  end
+
+  def env(key, value)
+    docker_command('ENV', [key, value].join(' '))
+  end
+
+  def expose(*keys)
+    docker_command('EXPOSE', (keys.size > 0 ? keys : port.keys).join(' '))
+  end
+
+  def cmd(*args)
+    docker_command('CMD', args.map(&:to_s).inspect)
+  end
+
+  def entry(*args)
+    docker_command('ENTRYPOINT', args.map(&:to_s).inspect)
+  end
+
+  def docker_command(command, arg)
+    @docker_commands ||= []
+    @docker_commands << [command, arg]
+  end
+
+  def rebuild_image
+    generate_dockerfile
+    build_image
+  end
+
+  def restart_container
+    rebuild_image
+    rerun_container
+  end
+
+  def generate_dockerfile
+    generate
+    File.open(node_pwd + 'Dockerfile', 'w') do |f|
+      content = @docker_commands.slice_when do |x, y|
+        !(x[0] == y[0] && x[0] == 'RUN')
+      end.flat_map do |x|
+        arg = x.map { |c| c[1] }.join(" && \\\n  ")
+        [x[0][0], arg].join(' ')
+      end.join("\n")
+      f.write(content)
+    end
+  end
+
+  def generate
+    raise 'subclass'
+  end
+
+  def build_image
+    Dir.chdir(app_name) do
+      file = "#{node_name}.tar.xz"
+      exclude = (volume_exclude + ['Rockerfile', '*.swp', '.gitignore'])
+      .map { |x| " --exclude #{x}" }.join(' ')
+      `tar -Jcvf #{file} -C #{node_name}#{exclude} .`
+      Image.build({t: image}, File.read(file))
+    end
+  end
+
+  def volume_exclude
+    raise 'subclass'
+  end
+
+  def dependent_volume_setup?
+    raise 'subclass'
+  end
+
+  def volume_setup?
+    raise 'subclass'
+  end
+
+  def do_setup_volume
+    if !dependent_volume_setup?
+      raise 'The dependent volume is not setup'
+    elsif Container.find(fullname)
+      raise 'The container is running'
+    end
+    setup_volume
+    generate_gitignore
+  end
+
+  def setup_volume
+    raise 'subclass'
+  end
+
+  def generate_gitignore
+    File.open(node_pwd + '.gitignore', 'w') do |f|
+      root = Pathname.new('/')
+      ignore = volume_exclude + gitignore
+      f.write(ignore.map { |v| "#{root + v}\n" }.join)
+    end
+  end
+
+  def gitignore
+    []
+  end
+
+  def do_clean_volume(filter = nil)
+    if !dependent_volume_setup?
+      raise 'The dependent volume is not setup'
+    elsif !volume_setup?
+      raise 'The volume is not setup'
+    elsif Container.find(fullname)
+      raise 'The container is running'
+    end
+    if self.class.instance_method(:clean_volume).arity == -1
+      clean_volume(filter)
+    else
+      clean_volume
+    end
+  end
+
+  def clean_volume
+    raise 'subclass'
+  end
+
+  def destroy_container
+    Container.find_and_destroy(fullname)
+  end
+
+  def remove_container
+    Container.find_and_destroy(fullname)
+    clean_volume
+  end
+
+  def rerun_container
+    Container.find_and_destroy(fullname)
+    if volume_setup?
+      run_container
+    else
+      raise 'The volume is not setup'
+    end
+  end
+
+  def exec_container(the_name, host_fields = {})
+    Container.exec({name: "#{fullname}_#{the_name}"}, {
+      Cmd: generate_script,
+      Image: image,
+      HostConfig: {
+        Binds: volume_to_binds(volume)
+      }.merge(host_fields)
+    }, {
+      follow: true,
+      stdout: true,
+      stderr: true
+    })
+  end
+
+  def run_container
+    Container.run({name: fullname}, {
+      Env: host_env.map { |k, v| "#{k}=#{v}" },
+      Image: image,
+        HostConfig: {
+        PortBindings: port_to_port_bindings(port),
+        Links: links_to_links(links),
+        Binds: volume_to_binds(volume)
+      }
+    })
+  end
+
+  def port_to_port_bindings(the_port)
+    the_port.map { |k,v| ["#{k}/tcp", [{HostPort: v}]] }.to_h
+  end
+
+  def links_to_links(the_links)
+    the_links.map do |name, alias_name|
+      "#{app_name}_#{name}:#{alias_name ? alias_name : name}"
+    end
+  end
+
+  def volume_to_binds(the_volume)
+    the_volume.map do |dir, host_dir, access|
+      "#{host_dir}:#{dir}#{access ? ":#{access}" : nil}"
+    end
+  end
+
+  def host_pwd
+    Pathname.new('/home/docker') + app_name + node_name
+  end
+
+  def fullname
+    @fullname ||= "#{app_name}_#{node_name}"
+  end
+
+  def image
+    @image ||= "#{app_name}/#{node_name}:v1"
+  end
+end
+
+class CLI
+
+  def run(args)
+    if args.size == 3
+      command, app_name, node_name = args
+      if command == 'regen'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.generate_dockerfile
+      elsif command == 'rebuild'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.rebuild_image
+      elsif command == 'rerun'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.rerun_container
+      elsif command == 'restart'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.restart_container
+      elsif command == 'destroy'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.destroy_container
+      elsif command == 'remove'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.remove_container
+      elsif command == 'clean'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.do_clean_volume
+      elsif command == 'setup'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.do_setup_volume
+      else
+        print(File.read("#{__FILE__}.md"))
+      end
+    elsif args.size == 4
+      command, app_name, node_name, method = args
+      if command == 'run'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.send(method)
+      elsif command == 'clean'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.do_clean_volume(method)
+      else
+        help
+      end
+    else
+      help
+    end
+  end
+
+  def help
+    print((Pathname.new(__FILE__).dirname + 'README.md').read)
+  end
+end
+
+CLI.new.run(ARGV)
