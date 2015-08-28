@@ -204,9 +204,9 @@ class ModelBuilder
     raise 'no subclass'
   end
 
-  def find_and_destroy(name)
+  def find_and_destroy(name, params)
     if container = find(name)
-      container.destroy
+      container.destroy(params)
     end
   end
 
@@ -303,7 +303,7 @@ class Model
     res.ok?(:show) ? res.to_json : nil
   end
 
-  def destroy(params = {signal: 'SIGTERM'})
+  def destroy(params)
     kill(params)
     wait
     delete

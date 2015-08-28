@@ -129,13 +129,17 @@ class Node
     run('echo', "$'#{content}'", '>>', file)
   end
 
-  def mkdir(dir)
+  def mkdir(dir, &block)
     dir.descend do |path|
       if !path.exist?
         Dir.mkdir(path)
-        `setfacl -m d:u:#{uid}:rwx #{path}`
-        `setfacl -m u:#{uid}:rwx #{path}`
-        `setfacl -m m:rwx #{path}`
+        if block_given?
+          block.call(path)
+        else
+          `setfacl -m d:u:#{uid}:rwx #{path}`
+          `setfacl -m u:#{uid}:rwx #{path}`
+          `setfacl -m m:rwx #{path}`
+        end
       end
     end
   end
@@ -177,6 +181,10 @@ class Node
     docker_command('ENV', [key, value].join(' '))
   end
 
+  def vol(*args)
+    docker_command('VOLUME', args.map(&:to_s).inspect)
+  end
+
   def expose(*keys)
     docker_command('EXPOSE', (keys.size > 0 ? keys : port.keys).join(' '))
   end
@@ -215,6 +223,7 @@ class Node
       end.join("\n")
       f.write(content)
     end
+    generate_gitignore
   end
 
   def generate
@@ -243,13 +252,17 @@ class Node
     raise 'subclass'
   end
 
-  def do_setup_volume
+  def do_setup_volume(filter = nil)
     if !dependent_volume_setup?
       raise 'The dependent volume is not setup'
     elsif Container.find(fullname)
       raise 'The container is running'
     end
-    setup_volume
+    if self.class.instance_method(:setup_volume).arity == -1
+      setup_volume(filter)
+    else
+      setup_volume
+    end
     generate_gitignore
   end
 
@@ -289,21 +302,25 @@ class Node
   end
 
   def destroy_container
-    Container.find_and_destroy(fullname)
+    Container.find_and_destroy(fullname, destroy_container_params)
   end
 
   def remove_container
-    Container.find_and_destroy(fullname)
+    Container.find_and_destroy(fullname, destroy_container_params)
     clean_volume
   end
 
   def rerun_container
-    Container.find_and_destroy(fullname)
+    Container.find_and_destroy(fullname, destroy_container_params)
     if volume_setup?
       run_container
     else
       raise 'The volume is not setup'
     end
+  end
+
+  def destroy_container_params
+    {signal: 'SIGTERM'}
   end
 
   def exec_container(the_name, host_fields = {})
@@ -322,14 +339,21 @@ class Node
 
   def run_container
     Container.run({name: fullname}, {
-      Env: host_env.map { |k, v| "#{k}=#{v}" },
+      Env: host_env_to_env(host_env),
       Image: image,
-        HostConfig: {
+      Tty: use_tty?,
+      HostConfig: {
         PortBindings: port_to_port_bindings(port),
         Links: links_to_links(links),
         Binds: volume_to_binds(volume)
       }
     })
+  end
+
+  def use_tty?;    false end
+
+  def host_env_to_env(the_host_env)
+    the_host_env.map { |k, v| "#{k}=#{v}" }
   end
 
   def port_to_port_bindings(the_port)
@@ -391,7 +415,7 @@ class CLI
         node = Node.load(Dir.pwd, app_name, node_name)
         node.do_setup_volume
       else
-        print(File.read("#{__FILE__}.md"))
+        help
       end
     elsif args.size == 4
       command, app_name, node_name, method = args
@@ -401,6 +425,9 @@ class CLI
       elsif command == 'clean'
         node = Node.load(Dir.pwd, app_name, node_name)
         node.do_clean_volume(method)
+      elsif command == 'setup'
+        node = Node.load(Dir.pwd, app_name, node_name)
+        node.do_setup_volume(method)
       else
         help
       end
